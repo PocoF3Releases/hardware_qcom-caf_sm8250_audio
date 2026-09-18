@@ -178,7 +178,8 @@ cc_library_shared {
     shared_libs: [
         "android.hardware.health@1.0",
         "android.hardware.health@2.0",
-        "android.hardware.power@1.2",
+        "android.hardware.health-V4-ndk",
+        "libbinder_ndk",
         "libbase",
         "libhidlbase",
         "liblog",
