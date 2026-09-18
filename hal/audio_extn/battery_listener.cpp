@@ -28,227 +28,310 @@
 */
 #define LOG_TAG "audio_hw::BatteryListener"
 #include <log/log.h>
-#include <android/hidl/manager/1.0/IServiceManager.h>
+#include <aidl/android/hardware/health/BnHealthInfoCallback.h>
+#include <aidl/android/hardware/health/IHealth.h>
+#include <android/binder_ibinder.h>
+#include <android/binder_manager.h>
+#include <android/binder_process.h>
 #include <android/hardware/health/2.0/IHealth.h>
 #include <healthhalutils/HealthHalUtils.h>
 #include <hidl/HidlTransportSupport.h>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
 #include "battery_listener.h"
 
-using android::hardware::interfacesEqual;
-using android::hardware::Return;
-using android::hardware::Void;
-using android::hardware::health::V1_0::BatteryStatus;
-using android::hardware::health::V1_0::toString;
-using android::hardware::health::V2_0::get_health_service;
-using android::hardware::health::V2_0::HealthInfo;
-using android::hardware::health::V2_0::IHealth;
-using android::hardware::health::V2_0::Result;
-using android::hidl::manager::V1_0::IServiceManager;
-using namespace std::literals::chrono_literals;
+namespace {
+namespace ah = aidl::android::hardware::health;
+namespace hh = android::hardware::health::V2_0;
+using BatteryStatus = android::hardware::health::V1_0::BatteryStatus;
+using namespace std::chrono_literals;
 
-namespace android {
+bool statusToBool(BatteryStatus status) {
+    return status == BatteryStatus::CHARGING || status == BatteryStatus::FULL;
+}
 
-#define GET_HEALTH_SVC_RETRY_CNT 5
-#define GET_HEALTH_SVC_WAIT_TIME_MS 500
-
-struct BatteryListenerImpl : public hardware::health::V2_0::IHealthInfoCallback,
-                             public hardware::hidl_death_recipient {
-    typedef std::function<void(bool)> cb_fn_t;
-    BatteryListenerImpl(cb_fn_t cb);
-    virtual ~BatteryListenerImpl ();
-    virtual hardware::Return<void> healthInfoChanged(
-        const hardware::health::V2_0::HealthInfo& info);
-    virtual void serviceDied(uint64_t cookie,
-                             const wp<hidl::base::V1_0::IBase>& who);
-    bool isCharging() {
-        std::lock_guard<std::mutex> _l(mLock);
-        return statusToBool(mStatus);
+BatteryStatus fromAidl(ah::BatteryStatus status) {
+    switch (status) {
+        case ah::BatteryStatus::CHARGING: return BatteryStatus::CHARGING;
+        case ah::BatteryStatus::DISCHARGING: return BatteryStatus::DISCHARGING;
+        case ah::BatteryStatus::NOT_CHARGING: return BatteryStatus::NOT_CHARGING;
+        case ah::BatteryStatus::FULL: return BatteryStatus::FULL;
+        default: return BatteryStatus::UNKNOWN;
     }
-    void reset();
-  private:
-    sp<hardware::health::V2_0::IHealth> mHealth;
-    status_t init();
-    BatteryStatus mStatus;
-    cb_fn_t mCb;
-    std::mutex mLock;
-    std::condition_variable mCond;
-    std::unique_ptr<std::thread> mThread;
-    bool mDone;
-    bool statusToBool(const BatteryStatus &s) const {
-        return (s == BatteryStatus::CHARGING) ||
-               (s ==  BatteryStatus::FULL);
+}
+
+// Callback objects outlive unregistration on some transports. They only hold
+// weak state, never a raw pointer to the listener or to the audio device.
+struct ListenerState {
+    std::mutex lock;
+    std::condition_variable cond;
+    BatteryStatus status = BatteryStatus::UNKNOWN;
+    uint64_t generation = 0;
+    bool done = false;
+    bool reconnect = false;
+
+    void update(uint64_t source, BatteryStatus value) {
+        std::lock_guard<std::mutex> guard(lock);
+        if (!done && source == generation && status != value) {
+            status = value;
+            cond.notify_all();
+        }
+    }
+
+    void died(uint64_t source) {
+        std::lock_guard<std::mutex> guard(lock);
+        if (!done && source == generation) {
+            reconnect = true;
+            cond.notify_all();
+        }
     }
 };
 
-status_t BatteryListenerImpl::init()
-{
-    int tries = 0;
-
-    if (mHealth != NULL)
-        return INVALID_OPERATION;
-
-    do {
-        mHealth = get_health_service();
-        if (mHealth != NULL)
-            break;
-        usleep(GET_HEALTH_SVC_WAIT_TIME_MS * 1000);
-        tries++;
-    } while(tries < GET_HEALTH_SVC_RETRY_CNT);
-
-    if (mHealth == NULL) {
-        ALOGE("no health service found, retries %d", tries);
-        return NO_INIT;
-    } else {
-        ALOGI("Get health service in %d tries", tries);
+struct AidlCallback : public ah::BnHealthInfoCallback {
+    std::weak_ptr<ListenerState> state;
+    const uint64_t generation;
+    AidlCallback(const std::shared_ptr<ListenerState>& s, uint64_t g)
+        : state(s), generation(g) {}
+    ndk::ScopedAStatus healthInfoChanged(const ah::HealthInfo& info) override {
+        if (auto s = state.lock()) s->update(generation, fromAidl(info.batteryStatus));
+        return ndk::ScopedAStatus::ok();
     }
-    mStatus = BatteryStatus::UNKNOWN;
-    auto ret = mHealth->getChargeStatus([&](Result r, BatteryStatus status) {
-        if (r != Result::SUCCESS) {
-            ALOGE("batterylistener: cannot get battery status");
-            return;
-        }
-        mStatus = status;
-    });
-    if (!ret.isOk())
-        ALOGE("batterylistener: get charge status transaction error");
+};
 
-    if (mStatus == BatteryStatus::UNKNOWN)
-        ALOGW("batterylistener: init: invalid battery status");
-    mDone = false;
-    mThread = std::make_unique<std::thread>([this]() {
-            std::unique_lock<std::mutex> l(mLock);
-            BatteryStatus local_status = mStatus;
-            while (!mDone) {
-                if (local_status == mStatus) {
-                    mCond.wait(l);
-                    continue;
-                }
-                local_status = mStatus;
-                switch (local_status) {
-                    // NOT_CHARGING is a special event that indicates, a battery is connected,
-                    // but not charging. This is seen for approx a second
-                    // after charger is plugged in. A charging event is eventually received.
-                    // We must try to avoid an unnecessary cb to HAL
-                    // only to call it again shortly.
-                    // An option to deal with this transient event would be to ignore this.
-                    // Or process this event with a slight delay (i.e cancel this event
-                    // if a different event comes in within a timeout
-                    case BatteryStatus::NOT_CHARGING : {
-                        auto mStatusnot_ncharging =
-                                [this, local_status]() { return mStatus != local_status; };
-                        mCond.wait_for(l, 3s, mStatusnot_ncharging);
-                        if (mStatusnot_ncharging()) // i.e event changed
-                            break;
-                    }
-                    [[fallthrough]];
-                    default:
-                        bool c = statusToBool(local_status);
-                        ALOGI("healthInfo cb thread: cb %s", c ? "CHARGING" : "NOT CHARGING");
-                        l.unlock();
-                        mCb(c);
-                        l.lock();
-                        break;
-                }
+struct HidlCallback : public hh::IHealthInfoCallback,
+                      public android::hardware::hidl_death_recipient {
+    std::weak_ptr<ListenerState> state;
+    const uint64_t generation;
+    HidlCallback(const std::shared_ptr<ListenerState>& s, uint64_t g)
+        : state(s), generation(g) {}
+    android::hardware::Return<void> healthInfoChanged(const hh::HealthInfo& info) override {
+        if (auto s = state.lock()) s->update(generation, info.legacy.batteryStatus);
+        return android::hardware::Void();
+    }
+    void serviceDied(uint64_t, const android::wp<android::hidl::base::V1_0::IBase>&) override {
+        if (auto s = state.lock()) s->died(generation);
+    }
+};
+
+struct DeathCookie {
+    std::weak_ptr<ListenerState> state;
+    uint64_t generation;
+};
+
+void onAidlDied(void* opaque) {
+    auto* cookie = static_cast<DeathCookie*>(opaque);
+    if (auto state = cookie->state.lock()) state->died(cookie->generation);
+}
+
+void onAidlUnlinked(void* opaque) {
+    // Also called if linkToDeath fails, and after any in-flight death callback.
+    delete static_cast<DeathCookie*>(opaque);
+}
+
+class BatteryListener {
+public:
+    explicit BatteryListener(battery_status_change_fn_t callback) : mCallback(callback) {
+        // Match the bounded initial discovery used by the old client. Callbacks
+        // only update state until the dispatch thread has been created.
+        for (int attempt = 0; attempt < 5 && !mConnected; ++attempt) {
+            mConnected = connect();
+            if (!mConnected && attempt != 4) std::this_thread::sleep_for(500ms);
+        }
+        if (!mConnected) ALOGW("Health unavailable; retrying on the listener thread");
+        mThread = std::thread(&BatteryListener::run, this);
+    }
+
+    ~BatteryListener() { stop(); }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> guard(mState->lock);
+            mState->done = true;
+            mState->cond.notify_all();
+        }
+        if (mThread.joinable()) mThread.join();
+    }
+
+    bool isCharging() const {
+        std::lock_guard<std::mutex> guard(mState->lock);
+        return statusToBool(mState->status);
+    }
+
+private:
+    const std::shared_ptr<ListenerState> mState = std::make_shared<ListenerState>();
+    const battery_status_change_fn_t mCallback;
+    std::thread mThread;
+    bool mConnected = false;
+    std::shared_ptr<ah::IHealth> mAidl;
+    std::shared_ptr<AidlCallback> mAidlCallback;
+    ndk::ScopedAIBinder_DeathRecipient mAidlDeath;
+    android::sp<hh::IHealth> mHidl;
+    android::sp<HidlCallback> mHidlCallback;
+
+    void disconnect() {
+        // Never hold ListenerState::lock across a synchronous Binder call.
+        // Increment the generation first so late callbacks are ignored.
+        {
+            std::lock_guard<std::mutex> guard(mState->lock);
+            ++mState->generation;
+        }
+        if (mAidl) {
+            auto result = mAidl->unregisterCallback(mAidlCallback);
+            if (!result.isOk()) ALOGV("AIDL Health callback already gone");
+        }
+        mAidlDeath.set(nullptr);
+        mAidlCallback.reset();
+        mAidl.reset();
+        if (mHidl) {
+            auto result = mHidl->unregisterCallback(mHidlCallback);
+            if (!result.isOk()) ALOGV("HIDL Health callback already gone");
+            auto unlinked = mHidl->unlinkToDeath(mHidlCallback);
+            if (!unlinked.isOk()) ALOGV("HIDL Health death recipient already gone");
+        }
+        mHidlCallback.clear();
+        mHidl.clear();
+        mConnected = false;
+    }
+
+    bool connect() {
+        uint64_t generation;
+        {
+            std::lock_guard<std::mutex> guard(mState->lock);
+            if (mState->done) return false;
+            generation = ++mState->generation;
+            mState->reconnect = false;
+        }
+        const std::string instance = std::string(ah::IHealth::descriptor) + "/default";
+        if (AServiceManager_isDeclared(instance.c_str())) {
+            // Do not wait indefinitely in audio initialization, and do not probe
+            // nonexistent HIDL services on an AIDL-only device.
+            ndk::SpAIBinder binder(AServiceManager_checkService(instance.c_str()));
+            if (!binder.get()) return false;
+            mAidl = ah::IHealth::fromBinder(binder);
+            if (!mAidl) return false;
+            ABinderProcess_startThreadPool();
+            mAidlCallback = ndk::SharedRefBase::make<AidlCallback>(mState, generation);
+            mAidlDeath.set(AIBinder_DeathRecipient_new(onAidlDied));
+            AIBinder_DeathRecipient_setOnUnlinked(mAidlDeath.get(), onAidlUnlinked);
+            auto* cookie = new DeathCookie{mState, generation};
+            if (AIBinder_linkToDeath(binder.get(), mAidlDeath.get(), cookie) != STATUS_OK) {
+                disconnect();
+                return false;
             }
-        });
-    mHealth->registerCallback(this);
-    mHealth->linkToDeath(this, 0 /* cookie */);
-    return NO_ERROR;
-}
-
-BatteryListenerImpl::BatteryListenerImpl(cb_fn_t cb) :
-        mCb(cb)
-{
-    init();
-}
-
-BatteryListenerImpl::~BatteryListenerImpl()
-{
-    mThread->join();
-}
-
-void BatteryListenerImpl::reset(){
-    std::lock_guard<std::mutex> _l(mLock);
-    if (mHealth != nullptr) {
-        mHealth->unregisterCallback(this);
-        mHealth->unlinkToDeath(this);
-    }
-    mStatus = BatteryStatus::UNKNOWN;
-    mDone = true;
-    mCond.notify_one();
-}
-void BatteryListenerImpl::serviceDied(uint64_t cookie __unused,
-                                     const wp<hidl::base::V1_0::IBase>& who)
-{
-    {
-        std::lock_guard<std::mutex> _l(mLock);
-        if (mHealth == NULL || !interfacesEqual(mHealth, who.promote())) {
-            ALOGE("health not initialized or unknown interface died");
-            return;
+            ah::BatteryStatus status = ah::BatteryStatus::UNKNOWN;
+            auto initial = mAidl->getChargeStatus(&status);
+            if (initial.isOk()) mState->update(generation, fromAidl(status));
+            auto registered = mAidl->registerCallback(mAidlCallback);
+            if (!registered.isOk()) {
+                disconnect();
+                return false;
+            }
+            // Close the query/register gap using the provider's normal update path.
+            auto updated = mAidl->update();
+            if (!updated.isOk()) ALOGW("AIDL Health initial update failed");
+            ALOGI("Using AIDL Health battery notifications");
+            return true;
         }
-        ALOGI("health service died, reinit");
-        mDone = true;
+
+        // Preserve devices which still declare the legacy HIDL provider.
+        mHidl = hh::get_health_service();
+        if (!mHidl) return false;
+        mHidlCallback = new HidlCallback(mState, generation);
+        auto linked = mHidl->linkToDeath(mHidlCallback, generation);
+        if (!linked.isOk() || !static_cast<bool>(linked)) {
+            disconnect();
+            return false;
+        }
+        auto initial = mHidl->getChargeStatus([&](hh::Result result, BatteryStatus status) {
+            if (result == hh::Result::SUCCESS) mState->update(generation, status);
+        });
+        if (!initial.isOk()) ALOGW("HIDL Health initial status query failed");
+        auto registered = mHidl->registerCallback(mHidlCallback);
+        if (!registered.isOk() || static_cast<hh::Result>(registered) != hh::Result::SUCCESS) {
+            disconnect();
+            return false;
+        }
+        auto updated = mHidl->update();
+        if (!updated.isOk()) ALOGW("HIDL Health initial update failed");
+        ALOGI("Using HIDL Health battery notifications");
+        return true;
     }
-    mThread->join();
-    std::lock_guard<std::mutex> _l(mLock);
-    init();
-}
 
-// this callback seems to be a SYNC callback and so
-// waits for return before next event is issued.
-// therefore we need not have a queue to process
-// NOT_CHARGING and CHARGING concurrencies.
-// Replace single var by a list if this assumption is broken
-Return<void> BatteryListenerImpl::healthInfoChanged(
-        const hardware::health::V2_0::HealthInfo& info)
-{
-    ALOGV("healthInfoChanged: %d", info.legacy.batteryStatus);
-    std::unique_lock<std::mutex> l(mLock);
-    if (info.legacy.batteryStatus != mStatus) {
-        mStatus = info.legacy.batteryStatus;
-        mCond.notify_one();
+    void run() {
+        std::unique_lock<std::mutex> guard(mState->lock);
+        auto delivered = mState->status;
+        while (!mState->done) {
+            if (!mConnected || mState->reconnect) {
+                guard.unlock();
+                disconnect();
+                mConnected = connect();
+                guard.lock();
+                if (!mConnected) {
+                    mState->cond.wait_for(guard, 500ms, [&] { return mState->done; });
+                }
+                continue;
+            }
+            if (delivered == mState->status) {
+                mState->cond.wait(guard, [&] {
+                    return mState->done || mState->reconnect || delivered != mState->status;
+                });
+                continue;
+            }
+            const auto status = mState->status;
+            if (status == BatteryStatus::NOT_CHARGING &&
+                mState->cond.wait_for(guard, 3s, [&] {
+                    return mState->done || mState->reconnect || mState->status != status;
+                })) {
+                continue;
+            }
+            delivered = status;
+            guard.unlock();
+            mCallback(statusToBool(status));
+            guard.lock();
+        }
+        guard.unlock();
+        disconnect();
     }
-    return Void();
-}
+};
 
-static sp<BatteryListenerImpl> batteryListener;
-status_t batteryPropertiesListenerInit(BatteryListenerImpl::cb_fn_t cb)
-{
-    batteryListener = new BatteryListenerImpl(cb);
-    return NO_ERROR;
-}
-
-status_t batteryPropertiesListenerDeinit()
-{
-    batteryListener->reset();
-    batteryListener.clear();
-    return OK;
-}
-
-bool batteryPropertiesListenerIsCharging()
-{
-    return batteryListener->isCharging();
-}
-
-} // namespace android
+std::mutex lifecycleLock;
+std::mutex listenerLock;
+std::shared_ptr<BatteryListener> listener;
+}  // namespace
 
 extern "C" {
-void battery_properties_listener_init(battery_status_change_fn_t fn)
-{
-    android::batteryPropertiesListenerInit([=](bool charging) {
-                                               fn(charging);
-                                          });
+void battery_properties_listener_init(battery_status_change_fn_t callback) {
+    if (!callback) return;
+    std::lock_guard<std::mutex> lifecycle(lifecycleLock);
+    {
+        std::lock_guard<std::mutex> guard(listenerLock);
+        if (listener) return;
+    }
+    auto created = std::make_shared<BatteryListener>(callback);
+    std::lock_guard<std::mutex> guard(listenerLock);
+    listener = std::move(created);
 }
 
-void battery_properties_listener_deinit()
-{
-    android::batteryPropertiesListenerDeinit();
+void battery_properties_listener_deinit() {
+    std::lock_guard<std::mutex> lifecycle(lifecycleLock);
+    std::shared_ptr<BatteryListener> old;
+    {
+        std::lock_guard<std::mutex> guard(listenerLock);
+        old = std::move(listener);
+    }
+    if (old) old->stop();
 }
 
-bool battery_properties_is_charging()
-{
-    return android::batteryPropertiesListenerIsCharging();
+bool battery_properties_is_charging() {
+    std::shared_ptr<BatteryListener> current;
+    {
+        std::lock_guard<std::mutex> guard(listenerLock);
+        current = listener;
+    }
+    return current && current->isCharging();
 }
-
-} // extern C
+}  // extern "C"
